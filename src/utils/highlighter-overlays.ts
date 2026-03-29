@@ -13,6 +13,7 @@ import {
 } from './highlighter';
 import { throttle } from './throttle';
 import { getElementByXPath, isDarkColor } from './dom-utils';
+import { mergeOverlayRects, Rect } from './highlighter-rects';
 
 let hoverOverlay: HTMLElement | null = null;
 
@@ -297,39 +298,9 @@ export function planHighlightOverlayRects(target: Element, highlight: AnyHighlig
 	}
 }
 
-// Two rects are on the same line if they overlap vertically by at least half
-// the shorter rect's height. This handles fonts where italic/bold glyphs have
-// different ascenders/descenders (e.g. EB Garamond italic vs roman).
-function rectsOnSameLine(a: DOMRect, b: DOMRect): boolean {
-	const overlapTop = Math.max(a.y, b.y);
-	const overlapBottom = Math.min(a.bottom, b.bottom);
-	const overlap = Math.max(0, overlapBottom - overlapTop);
-	return overlap >= Math.min(a.height, b.height) * 0.5;
-}
-
-// Merge a set of rectangles, to avoid adjacent and overlapping highlights where possible
+// Merge rects and create overlay DOM elements, skipping duplicates
 function mergeHighlightOverlayRects(rects: DOMRect[], content: string, existingOverlays: Element[], isText: boolean = false, index: number, notes?: string[], color?: string) {
-	let mergedRects: DOMRect[] = [];
-	let currentRect: DOMRect | null = null;
-
-	for (let i = 0; i < rects.length; i++) {
-		const rect = rects[i];
-		if (!currentRect) {
-			currentRect = new DOMRect(rect.x, rect.y, rect.width, rect.height);
-		} else if (rectsOnSameLine(currentRect, rect)) {
-			// Merge adjacent rects on the same line — use vertical union to
-			// cover height/baseline differences from italic/bold fonts (e.g. EB Garamond)
-			const top = Math.min(currentRect.y, rect.y);
-			const bottom = Math.max(currentRect.bottom, rect.bottom);
-			currentRect = new DOMRect(currentRect.x, top, rect.right - currentRect.x, bottom - top);
-		} else {
-			mergedRects.push(currentRect);
-			currentRect = new DOMRect(rect.x, rect.y, rect.width, rect.height);
-		}
-	}
-	if (currentRect) {
-		mergedRects.push(currentRect);
-	}
+	const mergedRects = mergeOverlayRects(rects);
 
 	for (const rect of mergedRects) {
 		const isDuplicate = existingOverlays.some(overlay => {
@@ -349,7 +320,7 @@ function mergeHighlightOverlayRects(rects: DOMRect[], content: string, existingO
 }
 
 // Create an overlay element
-function createHighlightOverlayElement(rect: DOMRect, content: string, isText: boolean = false, index: number, notes?: string[], color?: string) {
+function createHighlightOverlayElement(rect: Rect, content: string, isText: boolean = false, index: number, notes?: string[], color?: string) {
 	const overlay = document.createElement('div');
 	overlay.className = 'obsidian-highlight-overlay';
 	overlay.dataset.highlightIndex = index.toString();
