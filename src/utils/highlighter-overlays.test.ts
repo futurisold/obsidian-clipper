@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { rectsOnSameLine, mergeOverlayRects, Rect } from './highlighter-rects';
+import { rectsOnSameLine, mergeOverlayRects, tileOverlayRects, Rect } from './highlighter-rects';
 
 const R = (x: number, y: number, w: number, h: number): Rect =>
 	({ x, y, width: w, height: h, left: x, top: y, right: x + w, bottom: y + h });
@@ -135,5 +135,61 @@ describe('mergeOverlayRects', () => {
 		expect(textSelection).toHaveLength(1);
 		expect(textSelection[0].x).toBe(200);
 		expect(textSelection[0].width).toBe(150);
+	});
+});
+
+describe('tileOverlayRects', () => {
+	it('empty → empty', () => {
+		expect(tileOverlayRects([])).toEqual([]);
+	});
+
+	it('single rect → unchanged', () => {
+		const result = tileOverlayRects([R(10, 100, 500, 25)]);
+		expect(result).toHaveLength(1);
+		expect(result[0].height).toBe(25);
+	});
+
+	it('Garamond-like: shrinks height to line spacing (no overlap)', () => {
+		// glyph bbox 25px but line spacing 21.6px
+		const result = tileOverlayRects([
+			R(10, 100, 500, 25),
+			R(10, 121.6, 500, 25),
+			R(10, 143.2, 300, 25),
+		]);
+		expect(result).toHaveLength(3);
+		expect(result[0].height).toBeCloseTo(21.6);
+		expect(result[1].height).toBeCloseTo(21.6);
+		expect(result[2].height).toBe(25); // last line keeps glyph bbox
+	});
+
+	it('System-font-like: grows height to line spacing (no gap)', () => {
+		// glyph bbox 19px but line spacing 28.8px
+		const result = tileOverlayRects([
+			R(10, 100, 500, 19),
+			R(10, 128.8, 500, 19),
+			R(10, 157.6, 300, 19),
+		]);
+		expect(result).toHaveLength(3);
+		expect(result[0].height).toBeCloseTo(28.8);
+		expect(result[1].height).toBeCloseTo(28.8);
+		expect(result[2].height).toBe(19);
+	});
+
+	it('skips tiling when gap exceeds 2x height', () => {
+		const result = tileOverlayRects([
+			R(10, 100, 500, 20),
+			R(10, 200, 500, 20),
+		]);
+		expect(result[0].height).toBe(20);
+		expect(result[1].height).toBe(20);
+	});
+
+	it('preserves x and width', () => {
+		const result = tileOverlayRects([
+			R(50, 100, 400, 25),
+			R(50, 121, 400, 25),
+		]);
+		expect(result[0].x).toBe(50);
+		expect(result[0].width).toBe(400);
 	});
 });

@@ -13,9 +13,10 @@ import {
 } from './highlighter';
 import { throttle } from './throttle';
 import { getElementByXPath, isDarkColor } from './dom-utils';
-import { mergeOverlayRects, Rect } from './highlighter-rects';
+import { mergeOverlayRects, tileOverlayRects, Rect } from './highlighter-rects';
 
 let hoverOverlay: HTMLElement | null = null;
+
 
 // Convert hex color to rgba string
 export function hexToRgba(hex: string, alpha: number): string {
@@ -193,10 +194,9 @@ function findTextNodeAtOffset(element: Element, offset: number): { node: Node, o
 }
 
 // Calculate the average line height of a set of rectangles
-function calculateAverageLineHeight(rects: DOMRectList): number {
-	const heights = Array.from(rects).map(rect => rect.height);
-	const sum = heights.reduce((a, b) => a + b, 0);
-	return sum / heights.length;
+function calculateAverageLineHeight(rects: DOMRect[]): number {
+	const sum = rects.reduce((a, r) => a + r.height, 0);
+	return sum / rects.length;
 }
 
 function processRangeForOverlayRects(
@@ -216,9 +216,22 @@ function processRangeForOverlayRects(
 		return;
 	}
 
-	const averageLineHeight = calculateAverageLineHeight(rects);
-	const textRects = Array.from(rects).filter(rect => rect.height <= averageLineHeight * 1.5);
-	const complexRects = Array.from(rects).filter(rect => rect.height > averageLineHeight * 1.5);
+	// Firefox can return zero-size rects (line breaks, empty text nodes) and may
+	// return rects in non-reading order. Both break the merging algorithm, so
+	// normalise at the trust boundary before any geometry work.
+	const validRects = Array.from(rects)
+		.filter(r => r.width > 0 && r.height > 0)
+		.sort((a, b) => a.top !== b.top ? a.top - b.top : a.left - b.left);
+
+	if (validRects.length === 0) {
+		const rect = targetElementForFallback.getBoundingClientRect();
+		mergeHighlightOverlayRects([rect], content, existingOverlays, false, index, notes, color);
+		return;
+	}
+
+	const averageLineHeight = calculateAverageLineHeight(validRects);
+	const textRects = validRects.filter(r => r.height <= averageLineHeight * 1.5);
+	const complexRects = validRects.filter(r => r.height > averageLineHeight * 1.5);
 
 	if (textRects.length > 0) {
 		mergeHighlightOverlayRects(textRects, content, existingOverlays, true, index, notes, color);
@@ -298,11 +311,12 @@ export function planHighlightOverlayRects(target: Element, highlight: AnyHighlig
 	}
 }
 
-// Merge rects and create overlay DOM elements, skipping duplicates
+// Merge rects, tile to CSS line-height, and create overlay DOM elements
 function mergeHighlightOverlayRects(rects: DOMRect[], content: string, existingOverlays: Element[], isText: boolean = false, index: number, notes?: string[], color?: string) {
-	const mergedRects = mergeOverlayRects(rects);
+	const tiledRects = tileOverlayRects(mergeOverlayRects(rects));
 
-	for (const rect of mergedRects) {
+	for (let i = 0; i < tiledRects.length; i++) {
+		const rect = tiledRects[i];
 		const isDuplicate = existingOverlays.some(overlay => {
 			const overlayRect = overlay.getBoundingClientRect();
 			return (
@@ -314,22 +328,25 @@ function mergeHighlightOverlayRects(rects: DOMRect[], content: string, existingO
 		});
 
 		if (!isDuplicate) {
-			createHighlightOverlayElement(rect, content, isText, index, notes, color);
+			createHighlightOverlayElement(rect, content, isText, index, notes, color, i === 0, i === tiledRects.length - 1);
 		}
 	}
 }
 
-// Create an overlay element
-function createHighlightOverlayElement(rect: Rect, content: string, isText: boolean = false, index: number, notes?: string[], color?: string) {
+// Create an overlay element.  isFirst/isLast control vertical padding
+// so that adjacent tiled lines meet without gaps or overlap.
+function createHighlightOverlayElement(rect: Rect, content: string, isText: boolean = false, index: number, notes?: string[], color?: string, isFirst: boolean = true, isLast: boolean = true) {
 	const overlay = document.createElement('div');
 	overlay.className = 'obsidian-highlight-overlay';
 	overlay.dataset.highlightIndex = index.toString();
 
+	const topPad = isFirst ? 2 : 0;
+	const botPad = isLast ? 2 : 0;
 	overlay.style.position = 'absolute';
 	overlay.style.left = `${rect.left + window.scrollX - 2}px`;
-	overlay.style.top = `${rect.top + window.scrollY - 2}px`;
+	overlay.style.top = `${rect.top + window.scrollY - topPad}px`;
 	overlay.style.width = `${rect.width + 4}px`;
-	overlay.style.height = `${rect.height + 4}px`;
+	overlay.style.height = `${rect.height + topPad + botPad}px`;
 
 	// Detect dark background before choosing colors
 	const elementAtPoint = document.elementFromPoint(rect.left, rect.top);

@@ -42,7 +42,7 @@ export function mergeOverlayRects(rects: Rect[]): Rect[] {
 		} else if (rectsOnSameLine(lineRefY, lineRefB, rect.y, rect.bottom)) {
 			y = Math.min(y, rect.y);
 			b = Math.max(b, rect.bottom);
-			r = rect.right;
+			r = Math.max(r, rect.right);
 		} else {
 			merged.push(makeRect(x, y, r - x, b - y));
 			x = rect.x; y = rect.y; r = rect.right; b = rect.bottom;
@@ -53,4 +53,23 @@ export function mergeOverlayRects(rects: Rect[]): Rect[] {
 		merged.push(makeRect(x, y, r - x, b - y));
 	}
 	return merged;
+}
+
+// Adjust merged per-line rects so adjacent overlays tile with no gaps
+// or overlaps.  Each line's height becomes the y-distance to the next
+// line (≈ CSS line-height); the last line keeps its glyph-bbox height.
+export function tileOverlayRects(rects: Rect[]): Rect[] {
+	if (rects.length <= 1) return rects;
+	const tiled: Rect[] = [];
+	for (let i = 0; i < rects.length; i++) {
+		if (i < rects.length - 1) {
+			const lineSpacing = rects[i + 1].y - rects[i].y;
+			if (lineSpacing > 0 && lineSpacing < rects[i].height * 2) {
+				tiled.push(makeRect(rects[i].x, rects[i].y, rects[i].width, lineSpacing));
+				continue;
+			}
+		}
+		tiled.push(rects[i]);
+	}
+	return tiled;
 }
