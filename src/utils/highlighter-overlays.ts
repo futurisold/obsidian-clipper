@@ -393,13 +393,11 @@ function getEffectiveBackgroundColor(element: HTMLElement): string {
 
 // Update positions of all highlight overlays
 function updateHighlightOverlayPositions() {
+	if (highlights.length === 0) return;
 	highlights.forEach((highlight, index) => {
 		const target = getElementByXPath(highlight.xpath);
 		if (target) {
-			const existingOverlays = document.querySelectorAll(`.obsidian-highlight-overlay[data-highlight-index="${index}"]`);
-			if (existingOverlays.length > 0) {
-				removeExistingHighlightOverlays(index);
-			}
+			removeExistingHighlightOverlays(index);
 			planHighlightOverlayRects(target, highlight, index);
 		}
 	});
@@ -416,29 +414,26 @@ const throttledUpdateHighlights = throttle(() => {
 	}
 }, 100);
 
+// Overlays use position:absolute with document-absolute coords (scrollY baked
+// in at creation time), so they scroll with the page automatically.  Only
+// resize needs re-rendering (text reflow changes line rects).
 window.addEventListener('resize', throttledUpdateHighlights);
-window.addEventListener('scroll', throttledUpdateHighlights);
 
 const observer = new MutationObserver((mutations) => {
-	if (!isApplyingHighlights) {
-		const shouldUpdate = mutations.some(mutation => 
-			(mutation.type === 'childList' && 
-			 (mutation.target instanceof Element) && 
-			 !mutation.target.id.startsWith('obsidian-highlight')) || 
-			(mutation.type === 'attributes' && 
-			 (mutation.attributeName === 'style' || mutation.attributeName === 'class') &&
-			 (mutation.target instanceof Element) &&
-			 !mutation.target.id.startsWith('obsidian-highlight'))
-		);
-		if (shouldUpdate) {
-			throttledUpdateHighlights();
-		}
+	if (isApplyingHighlights || highlights.length === 0) return;
+	const shouldUpdate = mutations.some(mutation =>
+		(mutation.target instanceof Element) &&
+		!mutation.target.id.startsWith('obsidian-highlight') &&
+		!mutation.target.classList.contains('obsidian-highlight-overlay')
+	);
+	if (shouldUpdate) {
+		throttledUpdateHighlights();
 	}
 });
 
-observer.observe(document.body, { 
-	childList: true, 
-	subtree: true, 
+observer.observe(document.body, {
+	childList: true,
+	subtree: true,
 	attributes: true,
 	attributeFilter: ['style', 'class'],
 	characterData: false

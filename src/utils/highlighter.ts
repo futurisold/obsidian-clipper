@@ -16,6 +16,7 @@ import {
 } from './highlighter-overlays';
 import { detectBrowser, addBrowserClassToHtml } from './browser-detection';
 import { generalSettings, loadSettings } from './storage-utils';
+import { debounce } from './debounce';
 
 /**
  * Helper function to create SVG elements
@@ -71,8 +72,21 @@ export type AnyHighlightData = TextHighlightData | ElementHighlightData | Comple
 
 export let highlights: AnyHighlightData[] = [];
 export let isApplyingHighlights = false;
-let lastAppliedHighlights: string = '';
-let originalLinkClickHandlers: WeakMap<HTMLElement, (event: MouseEvent) => void> = new WeakMap();
+let highlightsVersion = 0;
+let lastAppliedVersion = -1;
+function setHighlights(value: AnyHighlightData[]) {
+	highlights = value;
+	highlightsVersion++;
+}
+// Single capture-phase listener blocks link navigation while highlighter is active.
+// Replaces per-link onclick overrides — O(1) instead of O(links).
+document.addEventListener('click', (e: Event) => {
+	if (!document.body.classList.contains('obsidian-highlighter-active')) return;
+	if ((e.target as Element)?.closest?.('a')) {
+		e.preventDefault();
+		e.stopPropagation();
+	}
+}, true);
 
 interface HistoryAction {
 	type: 'add' | 'remove';
@@ -149,7 +163,7 @@ type HighlightsStorage = Record<string, StoredData>;
 
 export function updateHighlights(newHighlights: AnyHighlightData[]) {
 	const oldHighlights = [...highlights];
-	highlights = newHighlights;
+	setHighlights(newHighlights);
 	addToHistory('add', oldHighlights, newHighlights);
 }
 
@@ -165,14 +179,13 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.addEventListener('touchmove', handleTouchMove);
 		document.addEventListener('touchend', handleMouseUp);
 		document.addEventListener('keydown', handleKeyDown);
-		disableLinkClicks();
 		createHighlighterMenu();
 		addBrowserClassToHtml();
 		updateSelectionColor(activeHighlightColor);
 		browser.runtime.sendMessage({ action: "highlighterModeChanged", isActive: true });
 		// Force full re-render — the DOM may have been rebuilt (reader toggle)
 		// or overlays removed on deactivation, so the dedup cache is stale.
-		lastAppliedHighlights = '';
+		lastAppliedVersion = -1;
 		applyHighlights();
 	} else {
 		document.removeEventListener('mouseup', handleMouseUp);
@@ -182,7 +195,6 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.removeEventListener('touchend', handleMouseUp);
 		document.removeEventListener('keydown', handleKeyDown);
 		removeHoverOverlay();
-		enableLinkClicks();
 		removeHighlighterMenu();
 		browser.runtime.sendMessage({ action: "highlighterModeChanged", isActive: false });
 		document.getElementById('obsidian-margin-notes-col')?.remove();
@@ -209,7 +221,7 @@ export function undo() {
 		const lastAction = highlightHistory.pop();
 		if (lastAction) {
 			redoHistory.push(lastAction);
-			highlights = [...lastAction.oldHighlights];
+			setHighlights([...lastAction.oldHighlights]);
 			applyHighlights();
 			saveHighlights();
 			updateHighlighterMenu();
@@ -223,7 +235,7 @@ export function redo() {
 		const nextAction = redoHistory.pop();
 		if (nextAction) {
 			highlightHistory.push(nextAction);
-			highlights = [...nextAction.newHighlights];
+			setHighlights([...nextAction.newHighlights]);
 			applyHighlights();
 			saveHighlights();
 			updateHighlighterMenu();
@@ -472,33 +484,6 @@ function removeHighlighterMenu() {
 	document.getElementById('obsidian-highlighter-menu-styles')?.remove();
 }
 
-// Disable clicking on links when highlighter is active
-function disableLinkClicks() {
-	document.querySelectorAll('a').forEach((link: HTMLElement) => {
-		const existingHandler = link.onclick;
-		if (existingHandler) {
-			originalLinkClickHandlers.set(link, existingHandler as (event: MouseEvent) => void);
-		}
-		link.onclick = (e: MouseEvent) => {
-			e.preventDefault();
-			e.stopPropagation();
-		};
-	});
-}
-
-// Restore original link click functionality
-function enableLinkClicks() {
-	document.querySelectorAll('a').forEach((link: HTMLElement) => {
-		const originalHandler = originalLinkClickHandlers.get(link);
-		if (originalHandler) {
-			link.onclick = originalHandler;
-			originalLinkClickHandlers.delete(link);
-		} else {
-			link.onclick = null;
-		}
-	});
-}
-
 // Highlight an entire element
 export function highlightElement(element: Element, notes?: string[]) {
 	let targetElement = element;
@@ -559,7 +544,7 @@ export function handleTextSelection(selection: Selection, notes?: string[]) {
 			currentBatchHighlights = mergeOverlappingHighlights(currentBatchHighlights, newHighlightWithNotes);
 		}
 		
-		highlights = currentBatchHighlights; // Update global highlights with the final merged result
+		setHighlights(currentBatchHighlights);
 		
 		// Only add to history if something actually changed from the initial global state
 		if (JSON.stringify(oldGlobalHighlights) !== JSON.stringify(highlights)) {
@@ -800,7 +785,7 @@ function addHighlight(highlight: AnyHighlightData, notes?: string[]) {
 	const oldHighlights = [...highlights];
 	const newHighlight = { ...highlight, notes: notes || [] };
 	const mergedHighlights = mergeOverlappingHighlights(highlights, newHighlight);
-	highlights = mergedHighlights;
+	setHighlights(mergedHighlights);
 	addToHistory('add', oldHighlights, mergedHighlights);
 	sortHighlights();
 	applyHighlights();
@@ -808,33 +793,32 @@ function addHighlight(highlight: AnyHighlightData, notes?: string[]) {
 	updateHighlighterMenu();
 }
 
-// Sort highlights based on their vertical position
+// Sort highlights based on their vertical position.
+// Caches XPath→position lookups so each unique xpath is resolved once (O(n))
+// instead of O(n log n) times inside the sort comparator.
 export function sortHighlights() {
-	highlights.sort((a, b) => {
-		const elementA = getElementByXPath(a.xpath);
-		const elementB = getElementByXPath(b.xpath);
-		if (elementA && elementB) {
-			const verticalDiff = getElementVerticalPosition(elementA) - getElementVerticalPosition(elementB);
-			
-			// If elements are at the same vertical position (same paragraph)
-			if (verticalDiff === 0) {
-				// If both are text highlights in the same element, sort by offset
-				if (a.type === 'text' && b.type === 'text' && a.xpath === b.xpath) {
-					return a.startOffset - b.startOffset;
-				}
-				// Otherwise, sort by horizontal position
-				return elementA.getBoundingClientRect().left - elementB.getBoundingClientRect().left;
+	const posCache = new Map<string, { top: number; left: number }>();
+	for (const h of highlights) {
+		if (!posCache.has(h.xpath)) {
+			const el = getElementByXPath(h.xpath);
+			if (el) {
+				const rect = el.getBoundingClientRect();
+				posCache.set(h.xpath, { top: rect.top + window.scrollY, left: rect.left });
 			}
-			
-			return verticalDiff;
+		}
+	}
+	highlights.sort((a, b) => {
+		const posA = posCache.get(a.xpath);
+		const posB = posCache.get(b.xpath);
+		if (posA && posB) {
+			if (posA.top !== posB.top) return posA.top - posB.top;
+			if (a.type === 'text' && b.type === 'text' && a.xpath === b.xpath) {
+				return a.startOffset - b.startOffset;
+			}
+			return posA.left - posB.left;
 		}
 		return 0;
 	});
-}
-
-// Get the vertical position of an element
-function getElementVerticalPosition(element: Element): number {
-	return element.getBoundingClientRect().top + window.scrollY;
 }
 
 // Check if two highlights overlap
@@ -950,36 +934,24 @@ function mergeHighlights(highlight1: AnyHighlightData, highlight2: AnyHighlightD
 	};
 }
 
-// Find the common ancestor of two elements
+// Find the common ancestor of two elements.  Uses a Set for O(depth) lookup.
 function findCommonAncestor(element1: Element, element2: Element): Element {
-	const parents1 = getParents(element1);
-	const parents2 = getParents(element2);
-
-	for (const parent of parents1) {
-		if (parents2.includes(parent)) {
-			return parent;
-		}
+	const ancestors = new Set<Element>();
+	let cur: Element | null = element1;
+	while (cur) {
+		ancestors.add(cur);
+		cur = cur.parentElement;
 	}
-
-	return document.body; // Fallback to body if no common ancestor found
+	cur = element2;
+	while (cur) {
+		if (ancestors.has(cur)) return cur;
+		cur = cur.parentElement;
+	}
+	return document.body;
 }
 
-// Get all parent elements of a given element
-function getParents(element: Element): Element[] {
-	const parents: Element[] = [];
-	let currentElement: Element | null = element;
-
-	while (currentElement && currentElement !== document.body) {
-		parents.unshift(currentElement);
-		currentElement = currentElement.parentElement;
-	}
-
-	parents.unshift(document.body);
-	return parents;
-}
-
-// Save highlights to browser storage
-export function saveHighlights() {
+// Save highlights to browser storage (debounced — coalesces rapid edits)
+export const saveHighlights = debounce(() => {
 	const url = window.location.href;
 	if (highlights.length > 0) {
 		const data: StoredData = { highlights, url };
@@ -989,14 +961,13 @@ export function saveHighlights() {
 			browser.storage.local.set({ highlights: allHighlights });
 		});
 	} else {
-		// Remove the entry if there are no highlights
 		browser.storage.local.get('highlights').then((result: { highlights?: HighlightsStorage }) => {
 			const allHighlights: HighlightsStorage = result.highlights || {};
 			delete allHighlights[url];
 			browser.storage.local.set({ highlights: allHighlights });
 		});
 	}
-}
+}, 300);
 
 // Apply all highlights to the page
 export function applyHighlights() {
@@ -1006,14 +977,12 @@ export function applyHighlights() {
 	}
 
 	if (isApplyingHighlights) return;
-	
-	const currentHighlightsState = JSON.stringify(highlights);
-	if (currentHighlightsState === lastAppliedHighlights) return;
-	
+	if (highlightsVersion === lastAppliedVersion) return;
+
 	isApplyingHighlights = true;
 
 	removeExistingHighlights();
-	
+
 	highlights.forEach((highlight, index) => {
 		const container = getElementByXPath(highlight.xpath);
 		if (container) {
@@ -1021,7 +990,7 @@ export function applyHighlights() {
 		}
 	});
 
-	lastAppliedHighlights = currentHighlightsState;
+	lastAppliedVersion = highlightsVersion;
 	isApplyingHighlights = false;
 	renderMarginNotes();
 	notifyHighlightsUpdated();
@@ -1048,19 +1017,18 @@ export async function loadHighlights() {
 	const storedData = allHighlights[url];
 	
 	if (storedData && Array.isArray(storedData.highlights) && storedData.highlights.length > 0) {
-		highlights = storedData.highlights;
-		
-		// Load settings to check if "Always show highlights" is enabled
+		setHighlights(storedData.highlights);
+
 		await loadSettings();
-		
+
 		if (generalSettings.alwaysShowHighlights) {
 			applyHighlights();
 			document.body.classList.add('obsidian-highlighter-always-show');
 		}
 	} else {
-		highlights = [];
+		setHighlights([]);
 	}
-	lastAppliedHighlights = JSON.stringify(highlights);
+	lastAppliedVersion = highlightsVersion;
 }
 
 // Clear all highlights from the page and storage
@@ -1071,7 +1039,7 @@ export function clearHighlights() {
 		const allHighlights: HighlightsStorage = result.highlights || {};
 		delete allHighlights[url];
 		browser.storage.local.set({ highlights: allHighlights }).then(() => {
-			highlights = [];
+			setHighlights([]);
 			removeExistingHighlights();
 			console.log('Highlights cleared for:', url);
 			browser.runtime.sendMessage({ action: "highlightsCleared" });
